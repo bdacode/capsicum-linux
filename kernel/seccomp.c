@@ -11,6 +11,7 @@
  * Mode 0x01 uses a fixed list of allowed system calls.
  * Mode 0x02 allows user-defined system call filters in the form
  *        of Berkeley Packet Filters/Linux Socket Filters.
+ * Mode 0x04 allows the LSM to filter system calls.
  * If multiple modes are enabled, the most restrictive result is
  * used.
  */
@@ -20,6 +21,7 @@
 #include <linux/compat.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
+#include <linux/security.h>
 
 /* #define SECCOMP_DEBUG 1 */
 
@@ -28,10 +30,10 @@
 #include <linux/filter.h>
 #include <linux/pid.h>
 #include <linux/ptrace.h>
-#include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/tracehook.h>
 #include <linux/uaccess.h>
+#include <linux/ftrace.h>
 
 static long _seccomp_set_mode(unsigned long mode, char * __user filter);
 
@@ -225,6 +227,17 @@ static u32 seccomp_run_filters(int syscall)
 	return ret;
 }
 
+/*
+ * Check whether the task has CAP_SYS_ADMIN in its namespace or is running with
+ * no_new_privs.
+ */
+static inline bool seccomp_has_no_new_privs(void)
+{
+	return task_no_new_privs(current) ||
+	       (security_capable_noaudit(current_cred(), current_user_ns(),
+					CAP_SYS_ADMIN) == 0);
+}
+
 /* Returns 1 if the candidate is an ancestor. */
 static int is_ancestor(struct seccomp_filter *candidate,
 		       struct seccomp_filter *child)
@@ -239,8 +252,8 @@ static int is_ancestor(struct seccomp_filter *candidate,
 }
 
 /* Expects locking and sync suitability to have been done already. */
-static void seccomp_sync_thread(struct task_struct *caller,
-				struct task_struct *thread)
+static void seccomp_sync_thread_filter(struct task_struct *caller,
+				       struct task_struct *thread)
 {
 	/* Get a task reference for the new leaf node. */
 	get_seccomp_filter(caller);
@@ -256,8 +269,8 @@ static void seccomp_sync_thread(struct task_struct *caller,
 	 * equivalent (see ptrace_may_access), it is safe to
 	 * allow one thread to transition the other.
 	 */
-	if (thread->seccomp.mode == SECCOMP_MODE_DISABLED) {
-		thread->seccomp.mode = SECCOMP_MODE_FILTER;
+	if (!(thread->seccomp.mode & SECCOMP_MODE_FILTER)) {
+		thread->seccomp.mode |= SECCOMP_MODE_FILTER;
 		/*
 		 * Don't let an unprivileged task work around
 		 * the no_new_privs restriction by creating
@@ -271,18 +284,18 @@ static void seccomp_sync_thread(struct task_struct *caller,
 }
 
 /**
- * seccomp_act_sync_threads: sets all threads to use current's filter
+ * seccomp_act_sync_threads_filter: sets all threads to use current's filter
  *
  * Returns 0 on success, -ve on error, or the pid of a thread which was
  * either not in the correct seccomp mode or it did not have an ancestral
  * seccomp filter.
  */
-static pid_t seccomp_act_sync_threads(void)
+static pid_t seccomp_act_sync_threads_filter(void)
 {
 	struct task_struct *thread, *caller;
 	pid_t failed = 0;
 
-	if (current->seccomp.mode != SECCOMP_MODE_FILTER)
+	if (!(current->seccomp.mode & SECCOMP_MODE_FILTER))
 		return -EACCES;
 
 	write_lock(&tasklist_lock);
@@ -293,10 +306,10 @@ static pid_t seccomp_act_sync_threads(void)
 		 * Validate thread being eligible for synchronization.
 		 */
 		if (thread->seccomp.mode == SECCOMP_MODE_DISABLED ||
-		    (thread->seccomp.mode == SECCOMP_MODE_FILTER &&
+		    ((thread->seccomp.mode & SECCOMP_MODE_FILTER) &&
 		     is_ancestor(thread->seccomp.filter,
 				 caller->seccomp.filter))) {
-			seccomp_sync_thread(caller, thread);
+			seccomp_sync_thread_filter(caller, thread);
 		} else {
 			/* Keep the last sibling that failed to return. */
 			failed = task_pid_vnr(thread);
@@ -308,6 +321,52 @@ static pid_t seccomp_act_sync_threads(void)
 	}
 	write_unlock(&tasklist_lock);
 	return failed;
+}
+
+/* Expects locking to have been done already. */
+static void seccomp_sync_thread_lsm(struct task_struct *caller,
+				    struct task_struct *thread)
+{
+	/* Opt the other thread into seccomp if needed.
+	 * As threads are considered to be trust-realm
+	 * equivalent (see ptrace_may_access), it is safe to
+	 * allow one thread to transition the other.
+	 */
+	if (!(thread->seccomp.mode & SECCOMP_MODE_LSM)) {
+		thread->seccomp.mode |= SECCOMP_MODE_LSM;
+		/*
+		 * Don't let an unprivileged task work around
+		 * the no_new_privs restriction by creating
+		 * a thread that sets it up, enters seccomp,
+		 * then dies.
+		 */
+		if (task_no_new_privs(caller))
+			task_set_no_new_privs(thread);
+		set_tsk_thread_flag(thread, TIF_SECCOMP);
+	}
+}
+
+/**
+ * seccomp_act_sync_threads_lsm: sets all threads to use current's LSM mode
+ *
+ * Returns 0 on success, -ve on error.
+ */
+static long seccomp_act_sync_threads_lsm(void)
+{
+	struct task_struct *thread, *caller;
+
+	if (!(current->seccomp.mode & SECCOMP_MODE_LSM))
+		return -EACCES;
+
+	write_lock(&tasklist_lock);
+	thread = caller = current;
+	while_each_thread(caller, thread) {
+		seccomp_lock(thread);
+		seccomp_sync_thread_lsm(caller, thread);
+		seccomp_unlock(thread);
+	}
+	write_unlock(&tasklist_lock);
+	return 0;
 }
 
 /**
@@ -337,9 +396,7 @@ static long seccomp_attach_filter(struct sock_fprog *fprog)
 	 * This avoids scenarios where unprivileged tasks can affect the
 	 * behavior of privileged children.
 	 */
-	if (!task_no_new_privs(current) &&
-	    security_capable_noaudit(current_cred(), current_user_ns(),
-				     CAP_SYS_ADMIN) != 0)
+	if (!seccomp_has_no_new_privs())
 		return -EACCES;
 
 	/* Allocate a new seccomp_filter */
@@ -426,7 +483,33 @@ static long seccomp_act_filter(unsigned long flags, char * __user filter)
 		return ret;
 
 	if (flags & SECCOMP_FILTER_TSYNC)
-		return seccomp_act_sync_threads();
+		return seccomp_act_sync_threads_filter();
+
+	return 0;
+}
+
+/**
+ * seccomp_act_lsm: enable LSM mode with additional flags
+ * @flags:  flags from SECCOMP_LSM_* to change behavior
+ *
+ * Return 0 on success, -ve on error.
+ */
+static long seccomp_act_lsm(unsigned long flags)
+{
+	long ret;
+
+	/* Only SECCOMP_LSM_TSYNC is recognized. */
+	if ((flags & ~(SECCOMP_LSM_TSYNC)) != 0)
+		return -EINVAL;
+
+	seccomp_lock(current);
+	ret = _seccomp_set_mode(SECCOMP_MODE_LSM, NULL);
+	seccomp_unlock(current);
+	if (ret)
+		return ret;
+
+	if (flags & SECCOMP_LSM_TSYNC)
+		return seccomp_act_sync_threads_lsm();
 
 	return 0;
 }
@@ -448,7 +531,17 @@ static long seccomp_extended_action(int action, unsigned long arg1,
 		/* arg1 and arg2 are currently unused. */
 		if (arg1 || arg2)
 			return -EINVAL;
-		return seccomp_act_sync_threads();
+		return seccomp_act_sync_threads_filter();
+	case SECCOMP_EXT_ACT_LSM:
+		/* arg2 is currently unused. */
+		if (arg2)
+			return -EINVAL;
+		return seccomp_act_lsm(arg1);
+	case SECCOMP_EXT_ACT_TSYNC_LSM:
+		/* arg1 and arg2 are currently unused. */
+		if (arg1 || arg2)
+			return -EINVAL;
+		return seccomp_act_sync_threads_lsm();
 	default:
 		break;
 	}
@@ -546,6 +639,15 @@ static u32 secure_computing_mode1(int this_syscall)
 	return SECCOMP_RET_KILL;
 }
 
+static u32 secure_computing_lsm(int this_syscall)
+{
+	unsigned long args[6];
+	struct pt_regs *regs = task_pt_regs(current);
+	int arch = syscall_get_arch(current, regs);
+	syscall_get_arguments(current, regs, 0, 6, args);
+	return security_intercept_syscall(arch, this_syscall, args);
+}
+
 int __secure_computing(int this_syscall)
 {
 	int modeset = current->seccomp.mode;
@@ -567,6 +669,11 @@ int __secure_computing(int this_syscall)
 #ifdef CONFIG_SECCOMP_FILTER
 		case SECCOMP_MODE_FILTER:
 			ret_mode = seccomp_run_filters(this_syscall);
+			break;
+#endif
+#ifdef CONFIG_SECCOMP_LSM
+		case SECCOMP_MODE_LSM:
+			ret_mode = secure_computing_lsm(this_syscall);
 			break;
 #endif
 		default:
@@ -649,6 +756,13 @@ static long _seccomp_set_mode(unsigned long seccomp_mode, char * __user filter)
 		ret = seccomp_attach_user_filter(filter);
 		if (ret)
 			goto out;
+		break;
+#endif
+#ifdef CONFIG_SECCOMP_LSM
+	case SECCOMP_MODE_LSM:
+		if (!seccomp_has_no_new_privs())
+			return -EACCES;
+		ret = 0;
 		break;
 #endif
 	default:
