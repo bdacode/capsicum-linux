@@ -17,6 +17,7 @@ struct seccomp_filter;
  * @lock:  held when making changes to avoid thread races.
  * @filter: must always point to a valid seccomp-filter or NULL as it is
  *          accessed without locking during system call entry.
+ * @flags: flags under write lock
  *
  *          @filter must only be accessed from the context of current as there
  *          is no locking.
@@ -25,7 +26,10 @@ struct seccomp {
 	int mode;
 	spinlock_t lock;
 	struct seccomp_filter *filter;
+	unsigned long flags;
 };
+
+#define SECCOMP_FLAG_NO_NEW_PRIVS	0
 
 extern int __secure_computing(int);
 static inline int secure_computing(int this_syscall)
