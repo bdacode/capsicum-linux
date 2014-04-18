@@ -14,14 +14,16 @@ struct seccomp_filter;
  *
  * @mode:  indicates one of the valid values above for controlled
  *         system calls available to a process.
- * @filter: The metadata and ruleset for determining what system calls
- *          are allowed for a task.
+ * @lock:  held when making changes to avoid thread races.
+ * @filter: must always point to a valid seccomp-filter or NULL as it is
+ *          accessed without locking during system call entry.
  *
  *          @filter must only be accessed from the context of current as there
  *          is no locking.
  */
 struct seccomp {
 	int mode;
+	spinlock_t lock;
 	struct seccomp_filter *filter;
 };
 

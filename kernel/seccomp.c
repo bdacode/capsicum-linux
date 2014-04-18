@@ -203,18 +203,18 @@ static int seccomp_check_filter(struct sock_filter *filter, unsigned int flen)
  */
 static u32 seccomp_run_filters(int syscall)
 {
-	struct seccomp_filter *f;
+	struct seccomp_filter *f = ACCESS_ONCE(current->seccomp.filter);
 	u32 ret = SECCOMP_RET_ALLOW;
 
 	/* Ensure unexpected behavior doesn't result in failing open. */
-	if (WARN_ON(current->seccomp.filter == NULL))
+	if (WARN_ON(f == NULL))
 		return SECCOMP_RET_KILL;
 
 	/*
 	 * All filters in the list are evaluated and the lowest BPF return
 	 * value always takes priority (ignoring the DATA).
 	 */
-	for (f = current->seccomp.filter; f; f = f->prev) {
+	for (; f; f = ACCESS_ONCE(f->prev)) {
 		u32 cur_ret = sk_run_filter(NULL, f->insns);
 		if ((cur_ret & SECCOMP_RET_ACTION) < (ret & SECCOMP_RET_ACTION))
 			ret = cur_ret;
@@ -319,7 +319,7 @@ out:
 /* get_seccomp_filter - increments the reference count of the filter on @tsk */
 void get_seccomp_filter(struct task_struct *tsk)
 {
-	struct seccomp_filter *orig = tsk->seccomp.filter;
+	struct seccomp_filter *orig = ACCESS_ONCE(tsk->seccomp.filter);
 	if (!orig)
 		return;
 	/* Reference count is bounded by the number of total processes. */
@@ -333,7 +333,7 @@ void put_seccomp_filter(struct task_struct *tsk)
 	/* Clean up single-reference branches iteratively. */
 	while (orig && atomic_dec_and_test(&orig->usage)) {
 		struct seccomp_filter *freeme = orig;
-		orig = orig->prev;
+		orig = ACCESS_ONCE(orig->prev);
 		kfree(freeme);
 	}
 }
@@ -494,6 +494,8 @@ long prctl_set_seccomp(unsigned long seccomp_mode, char __user *filter)
 {
 	long ret = -EINVAL;
 
+	seccomp_lock(current);
+
 	switch (seccomp_mode) {
 	case SECCOMP_MODE_STRICT:
 		ret = 0;
@@ -515,5 +517,6 @@ long prctl_set_seccomp(unsigned long seccomp_mode, char __user *filter)
 	current->seccomp.mode |= seccomp_mode;
 	set_thread_flag(TIF_SECCOMP);
 out:
+	seccomp_unlock(current);
 	return ret;
 }

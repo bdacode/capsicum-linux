@@ -2423,6 +2423,24 @@ static inline void task_unlock(struct task_struct *p)
 	spin_unlock(&p->alloc_lock);
 }
 
+#ifdef CONFIG_SECCOMP
+/*
+ * Protects changes to ->seccomp
+ */
+static inline void seccomp_lock(struct task_struct *p)
+{
+	spin_lock(&p->seccomp.lock);
+}
+
+static inline void seccomp_unlock(struct task_struct *p)
+{
+	spin_unlock(&p->seccomp.lock);
+}
+#else
+static inline void seccomp_lock(struct task_struct *p) { }
+static inline void seccomp_unlock(struct task_struct *p) { }
+#endif
+
 extern struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 							unsigned long *flags);
 
