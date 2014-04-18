@@ -26,6 +26,7 @@
 #ifdef CONFIG_SECCOMP_FILTER
 #include <asm/syscall.h>
 #include <linux/filter.h>
+#include <linux/pid.h>
 #include <linux/ptrace.h>
 #include <linux/security.h>
 #include <linux/slab.h>
@@ -224,6 +225,91 @@ static u32 seccomp_run_filters(int syscall)
 	return ret;
 }
 
+/* Returns 1 if the candidate is an ancestor. */
+static int is_ancestor(struct seccomp_filter *candidate,
+		       struct seccomp_filter *child)
+{
+	/* NULL is the root ancestor. */
+	if (candidate == NULL)
+		return 1;
+	for (; child; child = child->prev)
+		if (child == candidate)
+			return 1;
+	return 0;
+}
+
+/* Expects locking and sync suitability to have been done already. */
+static void seccomp_sync_thread(struct task_struct *caller,
+				struct task_struct *thread)
+{
+	/* Get a task reference for the new leaf node. */
+	get_seccomp_filter(caller);
+	/*
+	 * Drop the task reference to the shared ancestor since
+	 * current's path will hold a reference.  (This also
+	 * allows a put before the assignment.)
+	 */
+	put_seccomp_filter(thread);
+	thread->seccomp.filter = caller->seccomp.filter;
+	/* Opt the other thread into seccomp if needed.
+	 * As threads are considered to be trust-realm
+	 * equivalent (see ptrace_may_access), it is safe to
+	 * allow one thread to transition the other.
+	 */
+	if (thread->seccomp.mode == SECCOMP_MODE_DISABLED) {
+		thread->seccomp.mode = SECCOMP_MODE_FILTER;
+		/*
+		 * Don't let an unprivileged task work around
+		 * the no_new_privs restriction by creating
+		 * a thread that sets it up, enters seccomp,
+		 * then dies.
+		 */
+		if (task_no_new_privs(caller))
+			task_set_no_new_privs(thread);
+		set_tsk_thread_flag(thread, TIF_SECCOMP);
+	}
+}
+
+/**
+ * seccomp_act_sync_threads: sets all threads to use current's filter
+ *
+ * Returns 0 on success, -ve on error, or the pid of a thread which was
+ * either not in the correct seccomp mode or it did not have an ancestral
+ * seccomp filter.
+ */
+static pid_t seccomp_act_sync_threads(void)
+{
+	struct task_struct *thread, *caller;
+	pid_t failed = 0;
+
+	if (current->seccomp.mode != SECCOMP_MODE_FILTER)
+		return -EACCES;
+
+	write_lock(&tasklist_lock);
+	thread = caller = current;
+	while_each_thread(caller, thread) {
+		seccomp_lock(thread);
+		/*
+		 * Validate thread being eligible for synchronization.
+		 */
+		if (thread->seccomp.mode == SECCOMP_MODE_DISABLED ||
+		    (thread->seccomp.mode == SECCOMP_MODE_FILTER &&
+		     is_ancestor(thread->seccomp.filter,
+				 caller->seccomp.filter))) {
+			seccomp_sync_thread(caller, thread);
+		} else {
+			/* Keep the last sibling that failed to return. */
+			failed = task_pid_vnr(thread);
+			/* If the pid cannot be resolved, then return -ESRCH */
+			if (failed == 0)
+				failed = -ESRCH;
+		}
+		seccomp_unlock(thread);
+	}
+	write_unlock(&tasklist_lock);
+	return failed;
+}
+
 /**
  * seccomp_attach_filter: Attaches a seccomp filter to current.
  * @fprog: BPF program to install
@@ -323,21 +409,26 @@ out:
  * @flags:  flags from SECCOMP_FILTER_* to change behavior
  * @filter: struct sock_fprog for use with SECCOMP_MODE_FILTER
  *
- * Return 0 on success, -ve on error.
+ * Return 0 on success, -ve on error, or thread pid that caused failures.
  */
 static long seccomp_act_filter(unsigned long flags, char * __user filter)
 {
 	long ret;
 
-	/* No flags currently recognized. */
-	if (flags != 0)
+	/* Only SECCOMP_FILTER_TSYNC is recognized. */
+	if ((flags & ~(SECCOMP_FILTER_TSYNC)) != 0)
 		return -EINVAL;
 
 	seccomp_lock(current);
 	ret = _seccomp_set_mode(SECCOMP_MODE_FILTER, filter);
 	seccomp_unlock(current);
+	if (ret)
+		return ret;
 
-	return ret;
+	if (flags & SECCOMP_FILTER_TSYNC)
+		return seccomp_act_sync_threads();
+
+	return 0;
 }
 
 /**
@@ -353,6 +444,11 @@ static long seccomp_extended_action(int action, unsigned long arg1,
 	switch (action) {
 	case SECCOMP_EXT_ACT_FILTER:
 		return seccomp_act_filter(arg1, (char * __user)arg2);
+	case SECCOMP_EXT_ACT_TSYNC:
+		/* arg1 and arg2 are currently unused. */
+		if (arg1 || arg2)
+			return -EINVAL;
+		return seccomp_act_sync_threads();
 	default:
 		break;
 	}
