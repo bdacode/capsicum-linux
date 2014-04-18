@@ -12,6 +12,12 @@
 
 #define SECCOMP_MODE_VALID	0x03 /* mask of valid mode values. */
 
+/* Valid extension types as arg2 for prctl(PR_SECCOMP_EXT) */
+#define SECCOMP_EXT_ACT		1
+
+/* Valid extension actions as arg3 to prctl(PR_SECCOMP_EXT, SECCOMP_EXT_ACT) */
+#define SECCOMP_EXT_ACT_FILTER	1 /* apply seccomp-bpf filter with flags */
+
 /*
  * All BPF programs must return a 32-bit value.
  * The bottom 16-bits are for optional return data.

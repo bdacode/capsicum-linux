@@ -32,6 +32,8 @@
 #include <linux/tracehook.h>
 #include <linux/uaccess.h>
 
+static long _seccomp_set_mode(unsigned long mode, char * __user filter);
+
 /**
  * struct seccomp_filter - container for seccomp BPF programs
  *
@@ -316,6 +318,47 @@ out:
 	return ret;
 }
 
+/**
+ * seccomp_act_filter: attach filter with additional flags
+ * @flags:  flags from SECCOMP_FILTER_* to change behavior
+ * @filter: struct sock_fprog for use with SECCOMP_MODE_FILTER
+ *
+ * Return 0 on success, -ve on error.
+ */
+static long seccomp_act_filter(unsigned long flags, char * __user filter)
+{
+	long ret;
+
+	/* No flags currently recognized. */
+	if (flags != 0)
+		return -EINVAL;
+
+	seccomp_lock(current);
+	ret = _seccomp_set_mode(SECCOMP_MODE_FILTER, filter);
+	seccomp_unlock(current);
+
+	return ret;
+}
+
+/**
+ * seccomp_extended_action: performs the specific action
+ * @action: the enum of the action to perform.
+ *
+ * Returns 0 on success. On failure, it returns != 0, or EINVAL on an
+ * invalid action.
+ */
+static long seccomp_extended_action(int action, unsigned long arg1,
+				    unsigned long arg2)
+{
+	switch (action) {
+	case SECCOMP_EXT_ACT_FILTER:
+		return seccomp_act_filter(arg1, (char * __user)arg2);
+	default:
+		break;
+	}
+	return -EINVAL;
+}
+
 /* get_seccomp_filter - increments the reference count of the filter on @tsk */
 void get_seccomp_filter(struct task_struct *tsk)
 {
@@ -356,6 +399,23 @@ static void seccomp_send_sigsys(int syscall, int reason)
 	info.si_arch = syscall_get_arch(current, task_pt_regs(current));
 	info.si_syscall = syscall;
 	force_sig_info(SIGSYS, &info, current);
+}
+
+/**
+ * prctl_seccomp_ext: exposed extension behaviors for seccomp
+ * @cmd: the type of extension being called
+ * @arg[123]: the arguments for the extension
+ *
+ * Returns == 0 on success and != 0 on failure.
+ * Invalid arguments return -EINVAL.
+ */
+long prctl_seccomp_ext(unsigned long type, unsigned long arg1,
+		       unsigned long arg2, unsigned long arg3)
+{
+	if (type != SECCOMP_EXT_ACT)
+		return -EINVAL;
+	/* For action extensions, arg1 is the identifier. */
+	return seccomp_extended_action(arg1, arg2, arg3);
 }
 #endif	/* CONFIG_SECCOMP_FILTER */
 

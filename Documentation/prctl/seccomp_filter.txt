@@ -223,3 +223,17 @@ Note that modern systems are unlikely to use vsyscalls at all -- they
 are a legacy feature and they are considerably slower than standard
 syscalls.  New code will use the vDSO, and vDSO-issued system calls
 are indistinguishable from normal system calls.
+
+
+
+Extensions
+----------
+Additional seccomp extensions are available through prctl using
+PR_SECCOMP_EXT, with the extension as the following argument.
+
+prctl(PR_SECCOMP_EXT, SECCOMP_EXT_ACT, SECCOMP_EXT_ACT_FILTER, flags, prog):
+	Attach filter, with flags.
+
+	This is the same as prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)
+	except with the addition of optional "flags" argument. No flags
+	are currently recognized.
