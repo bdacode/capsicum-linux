@@ -476,25 +476,10 @@ long prctl_get_seccomp(void)
 	return current->seccomp.mode;
 }
 
-/**
- * prctl_set_seccomp: configures current->seccomp.mode
- * @seccomp_mode: requested mode to use; only a single bit should be set
- * @filter: optional struct sock_fprog for use with SECCOMP_MODE_FILTER
- *
- * This function may be called repeatedly with a @seccomp_mode of
- * SECCOMP_MODE_FILTER to install additional filters.  Every filter
- * successfully installed will be evaluated (in reverse order) for each system
- * call the task makes.
- *
- * Once bits are set in current->seccomp.mode, they may not be cleared.
- *
- * Returns 0 on success or -EINVAL on failure.
- */
-long prctl_set_seccomp(unsigned long seccomp_mode, char __user *filter)
+/* Expects to be called under seccomp lock. */
+static long _seccomp_set_mode(unsigned long seccomp_mode, char * __user filter)
 {
 	long ret = -EINVAL;
-
-	seccomp_lock(current);
 
 	switch (seccomp_mode) {
 	case SECCOMP_MODE_STRICT:
@@ -517,6 +502,29 @@ long prctl_set_seccomp(unsigned long seccomp_mode, char __user *filter)
 	current->seccomp.mode |= seccomp_mode;
 	set_thread_flag(TIF_SECCOMP);
 out:
+	return ret;
+}
+
+/**
+ * prctl_set_seccomp: configures current->seccomp.mode
+ * @seccomp_mode: requested mode to use; only a single bit should be set
+ * @filter: optional struct sock_fprog for use with SECCOMP_MODE_FILTER
+ *
+ * This function may be called repeatedly with a @seccomp_mode of
+ * SECCOMP_MODE_FILTER to install additional filters.  Every filter
+ * successfully installed will be evaluated (in reverse order) for each system
+ * call the task makes.
+ *
+ * Once bits are set in current->seccomp.mode, they may not be cleared.
+ *
+ * Returns 0 on success or -EINVAL on failure.
+ */
+long prctl_set_seccomp(unsigned long seccomp_mode, char __user *filter)
+{
+	long ret;
+
+	seccomp_lock(current);
+	ret = _seccomp_set_mode(seccomp_mode, filter);
 	seccomp_unlock(current);
 	return ret;
 }
